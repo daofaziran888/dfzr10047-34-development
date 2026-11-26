@@ -41,6 +41,76 @@ class FieldParseService(BaseModuleService):
         rows.append(entry)
         return entry
 
+    def write_back_revision(self, intake_batch: str, row_num: str,
+                            values: dict[str, Any], reviewer: str,
+                            review_time: str) -> list[dict[str, Any]]:
+        """把坏行复核确认的修订值写回解析批次。
+
+        同一原行的字段解析明细只保留一条有效记录：已存在该字段就改写解析取值并置为
+        解析成功，不存在才新增。这样重复回补不会在批次里造出第二条成功行。
+        """
+        rows = store.rows(self.MODULE)
+        written: list[dict[str, Any]] = []
+        for field_name, value in values.items():
+            text = "" if value is None else str(value)
+            target = next(
+                (r for r in rows
+                 if str(r.get("关联批次")) == str(intake_batch)
+                 and str(r.get("解析行号")) == str(row_num)
+                 and str(r.get("字段名称")) == str(field_name)),
+                None)
+            if target is not None:
+                target["解析取值"] = text
+                target["status"] = "解析成功"
+                target["pending"] = False
+                target["abnormal"] = False
+                target["复核人"] = reviewer
+                target["复核时间"] = review_time
+                written.append(dict(target))
+                continue
+            template = next(
+                (r.get("命中模板") for r in rows
+                 if str(r.get("关联批次")) == str(intake_batch)
+                 and str(r.get("解析行号")) == str(row_num) and r.get("命中模板")),
+                "")
+            entry = {
+                "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+                "status": "解析成功",
+                "pending": False,
+                "abnormal": False,
+                "解析编号": f"FP-{intake_batch}-{row_num}-{field_name}",
+                "关联批次": intake_batch,
+                "命中模板": template or "",
+                "字段名称": str(field_name),
+                "原始取值": "",
+                "解析取值": text,
+                "解析耗时": "0",
+                "解析行号": str(row_num),
+                "复核人": reviewer,
+                "复核时间": review_time,
+                "复核回补": "是",
+            }
+            rows.append(entry)
+            written.append(dict(entry))
+        # 同一行其余字段若有部分失败记录，行状态以聚合后的真实结果为准。
+        self._settle_row_status(intake_batch, row_num)
+        return written
+
+    def _settle_row_status(self, intake_batch: str, row_num: str) -> None:
+        row_fields = [
+            r for r in store.rows(self.MODULE)
+            if str(r.get("关联批次")) == str(intake_batch)
+            and str(r.get("解析行号")) == str(row_num)
+        ]
+        if not row_fields:
+            return
+        still_failed = any(r.get("status") == "部分失败" for r in row_fields)
+        for r in row_fields:
+            if r.get("status") in ("解析成功", "部分失败"):
+                r["status"] = "部分失败" if still_failed else "解析成功"
+                r["pending"] = still_failed
+                r["abnormal"] = still_failed
+
     def failed_fields_of_batch(self, intake_batch: str) -> list[dict[str, Any]]:
         """输出解析失败字段清单（含行号），坏行隔离据此建隔离行。"""
         return [

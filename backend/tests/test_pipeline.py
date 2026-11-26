@@ -2507,3 +2507,176 @@ class TestIntakeAuditAndServices:
         assert audits[-1]["变更后值"] == "探测格式xlsx"
         snap = audit_svc.domain_snapshot()
         assert snap["count"] >= 6
+
+
+# ======================================================================
+# 坏行复核清单：按批次/字段查询、领办范围、双人复核、幂等回补、契约复验
+# ======================================================================
+
+DEMO_BATCH = "FI-20260903001"
+DEMO_CONTRACT = "OC-005"
+DEMO_COLUMNS = ["rec_id", "rec_timestamp", "data_value", "payload_bytes"]
+
+
+class TestQuarantineChecklist:
+    def test_checklist_ordered_by_row_and_lists_evidence(self, fresh_store):
+        svc = SERVICES["row_quarantine"]
+        items = svc.review_checklist(DEMO_BATCH)
+        assert [i["原始行号"] for i in items] == ["7", "8"]
+        assert items[0]["失败字段"] == ["postal_code"]
+        assert items[0]["证据"][0]["原始行文本"].startswith("R-20260903-00007")
+
+    def test_checklist_filtered_by_failed_field(self, fresh_store):
+        svc = SERVICES["row_quarantine"]
+        only_amount = svc.filter_checklist(DEMO_BATCH, ["amount"])
+        assert [i["原始行号"] for i in only_amount] == ["8"]
+        both = svc.filter_checklist(DEMO_BATCH, ["postal_code", "amount"])
+        assert [i["原始行号"] for i in both] == ["7", "8"]
+
+    def test_same_row_absent_field_cannot_be_claimed(self, fresh_store):
+        svc = SERVICES["row_quarantine"]
+        ok, msg, _row = svc.claim_row("RQ-007", "乙", ["amount"], "t")
+        assert ok is False
+        assert "可处理范围" in msg
+
+    def test_two_reviewers_claim_different_fields_of_same_row(self, fresh_store):
+        svc = SERVICES["row_quarantine"]
+        ok_a, _msg, _row = svc.claim_row("RQ-007", "甲", ["postal_code"], "t1")
+        assert ok_a is True
+        svc.quarantine_failure(DEMO_BATCH, 7, "raw", "amount", "格式异常：金额非数值", "t2")
+        ok_b, _msg_b, _row_b = svc.claim_row("RQ-007", "乙", ["amount"], "t3")
+        assert ok_b is True
+        # 同一字段不能被第二个人重复领取
+        again, msg_again, _ = svc.claim_row("RQ-007", "丙", ["amount"], "t4")
+        assert again is False
+        assert "领办" in msg_again
+
+    def test_unfinished_field_keeps_row_quarantined(self, fresh_store):
+        svc = SERVICES["row_quarantine"]
+        svc.claim_row("RQ-007", "甲", ["postal_code"], "t1")
+        svc.quarantine_failure(DEMO_BATCH, 7, "raw", "amount", "格式异常：金额非数值", "t2")
+        ok, msg, row = svc.apply_revision("RQ-007", "甲", {"postal_code": "200433"}, "t3")
+        assert ok is True
+        assert "尚未核完" in msg
+        assert row["status"] == "复核中"
+        blocked, _bmsg = svc.blocks_contract(DEMO_BATCH)
+        assert blocked is True
+
+    def test_receipt_keeps_values_and_marks_reclaim(self, fresh_store):
+        svc = SERVICES["row_quarantine"]
+        svc.claim_row("RQ-007", "甲", ["postal_code"], "t1")
+        svc.quarantine_failure(DEMO_BATCH, 7, "raw", "amount", "格式异常：金额非数值", "t2")
+        svc.claim_row("RQ-007", "乙", ["amount"], "t3")
+        svc.apply_revision("RQ-007", "甲", {"postal_code": "200433"}, "t4")
+        receipt = svc.change_receipt("RQ-007")
+        assert receipt["已填修订值"] == {"postal_code": "200433"}
+        assert receipt["可提交字段"] == []
+        assert any("amount" in item for item in receipt["需重新领取"])
+
+    def test_reinstate_writes_single_success_row_when_repeated(self, fresh_store):
+        svc = SERVICES["row_quarantine"]
+        batch_svc = SERVICES["parse_batch"]
+        before = batch_svc.tally_from_field_parse(DEMO_BATCH)["success_rows"]
+        ok1, _m1, _r1 = svc.apply_revision("RQ-008", "乙", {"amount": "100.5"}, "t1")
+        assert ok1 is True
+        after_first = SERVICES["parse_batch"].tally_from_field_parse(DEMO_BATCH)["success_rows"]
+        assert after_first == before + 1
+        # 重复提交：不再增加成功行
+        ok2, _m2, _r2 = svc.apply_revision("RQ-008", "乙", {"amount": "100.5"}, "t2")
+        assert ok2 is True
+        after_second = SERVICES["parse_batch"].tally_from_field_parse(DEMO_BATCH)["success_rows"]
+        assert after_second == after_first
+        batch = next(r for r in store.rows("parse_batch") if r["关联投递批次"] == DEMO_BATCH)
+        assert batch["成功行数"] == "9"
+        assert batch["隔离行数"] == "1"
+
+    def test_evidence_trail_includes_later_added_error(self, fresh_store):
+        svc = SERVICES["row_quarantine"]
+        svc.quarantine_failure(DEMO_BATCH, 7, "raw-later", "amount", "格式异常：金额非数值", "t2")
+        trail = svc.row_evidence_trail(DEMO_BATCH, "7")
+        assert [e["证据序号"] for e in trail["证据"]] == [1, 2]
+        assert trail["证据"][1]["原始行文本"] == "raw-later"
+        assert trail["证据"][1]["失败字段"] == ["amount"]
+
+
+class TestReinstateContractScenario:
+    def test_pending_row_blocks_contract_until_both_resolved(self, fresh_store):
+        q = SERVICES["row_quarantine"]
+        c = SERVICES["output_contract"]
+        q.claim_row("RQ-007", "甲", ["postal_code"], "t1")
+        q.quarantine_failure(DEMO_BATCH, 7, "raw", "amount", "格式异常：金额非数值", "t2")
+        q.claim_row("RQ-007", "乙", ["amount"], "t3")
+        # 另一个窗口先回补第 8 行
+        ok8, _m8, _r8 = q.apply_revision("RQ-008", "乙", {"amount": "100.5"}, "t4")
+        assert ok8 is True
+        passed, failures, _ct = c.revalidate_after_reinstate(DEMO_CONTRACT, DEMO_COLUMNS, None, "t5")
+        assert passed is False
+        assert any("隔离未复核" in f for f in failures)
+        # 第 7 行只解决了邮编，金额未核完仍然阻断
+        q.apply_revision("RQ-007", "甲", {"postal_code": "200433"}, "t6")
+        passed2, failures2, _ct2 = c.revalidate_after_reinstate(DEMO_CONTRACT, DEMO_COLUMNS, None, "t7")
+        assert passed2 is False
+        assert any("行号 ['7']" in f or "7" in f for f in failures2)
+        # 金额也核完 → 契约通过
+        q.apply_revision("RQ-007", "乙", {"amount": "150.5"}, "t8")
+        passed3, failures3, _ct3 = c.revalidate_after_reinstate(DEMO_CONTRACT, DEMO_COLUMNS, None, "t9")
+        assert passed3 is True, failures3
+        assert not failures3
+
+    def test_retry_submitted_twice_success_rows_stop_at_ten(self, fresh_store):
+        q = SERVICES["row_quarantine"]
+        c = SERVICES["output_contract"]
+        q.quarantine_failure(DEMO_BATCH, 7, "raw", "amount", "格式异常：金额非数值", "t1")
+        q.apply_revision("RQ-007", "甲", {"postal_code": "200433", "amount": "150.5"}, "t2")
+        q.apply_revision("RQ-008", "乙", {"amount": "100.5"}, "t3")
+        batch = next(r for r in store.rows("parse_batch") if r["关联投递批次"] == DEMO_BATCH)
+        assert batch["成功行数"] == "10"
+        # 重试提交两次：成功行仍停在 10
+        q.apply_revision("RQ-007", "甲", {"postal_code": "200433", "amount": "150.5"}, "t4")
+        q.apply_revision("RQ-008", "乙", {"amount": "100.5"}, "t5")
+        assert batch["成功行数"] == "10"
+        assert batch["隔离行数"] == "0"
+        passed, failures, contract = c.revalidate_after_reinstate(
+            DEMO_CONTRACT, DEMO_COLUMNS, None, "t6")
+        assert passed is True, failures
+        assert contract["实际行数"] == "10"
+
+
+class TestQuarantineReviewApi:
+    """接口层用 FastAPI TestClient 走真实路由；环境未装 httpx 时跳过。"""
+
+    def _client(self):
+        # starlette 的 TestClient 需要 httpx2；环境没有就直接跳过接口用例。
+        pytest.importorskip("httpx2", reason="TestClient 需要 httpx2")
+        from fastapi.testclient import TestClient
+
+        from app.main import app
+
+        return TestClient(app)
+
+    def test_checklist_endpoint_filters_by_field(self, fresh_store):
+        client = self._client()
+        resp = client.get("/api/row_quarantine/checklist",
+                          params={"batch": DEMO_BATCH, "fields": "amount"})
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert [i["原始行号"] for i in payload["items"]] == ["8"]
+
+    def test_receipt_endpoint_after_claim(self, fresh_store):
+        client = self._client()
+        SERVICES["row_quarantine"].claim_row("RQ-007", "甲", ["postal_code"], "t1")
+        resp = client.get("/api/row_quarantine/RQ-007/receipt")
+        assert resp.status_code == 200
+        assert resp.json()["隔离编号"] == "RQ-007"
+
+    def test_validate_endpoint_uses_actual_rows(self, fresh_store):
+        client = self._client()
+        resp = client.post("/api/output_contract/validate", json={
+            "contract_no": DEMO_CONTRACT,
+            "actual_columns": DEMO_COLUMNS,
+            "check_time": "t",
+        })
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is False
+        assert body["entry"]["实际行数"] == "8"

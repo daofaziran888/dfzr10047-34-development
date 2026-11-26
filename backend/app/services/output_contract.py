@@ -38,7 +38,7 @@ class OutputContractService(BaseModuleService):
         if contract is None:
             return False, [f"契约 {contract_no} 不存在"], None
 
-        intake_batch = str(contract.get("关联批次") or "")
+        intake_batch = self._intake_batch_of(contract)
         failures: list[str] = []
 
         quarantine_blocked, quarantine_msg = self._quarantine_block(intake_batch)
@@ -83,17 +83,69 @@ class OutputContractService(BaseModuleService):
         contract["abnormal"] = not passed
         return passed, failures, dict(contract)
 
-    def _quarantine_block(self, intake_batch: str) -> tuple[bool, str]:
-        """未复核隔离行阻断契约。"""
-        rows = store.rows("row_quarantine")
-        # 批次记录里存的是关联投递批次，隔离行里存的是关联批次（同为投递批次编号）
-        candidates = {intake_batch}
+    def _intake_batch_of(self, contract: dict[str, Any]) -> str:
+        """契约的关联批次可能是批次记录编号，换成投递批次编号统一比对。"""
+        linked = str(contract.get("关联批次") or "")
         for batch in store.rows("parse_batch"):
-            if batch.get("批次记录编号") == intake_batch:
-                candidates.add(str(batch.get("关联投递批次") or ""))
+            if batch.get("批次记录编号") == linked:
+                return str(batch.get("关联投递批次") or linked)
+        return linked
+
+    def actual_rows_of_batch(self, contract_no: str) -> int:
+        """回补后的实际行数：按字段解析明细中全成功的原行去重计数。
+
+        同一原行只算一条成功行，回补多少次都不会让实际行数虚增；仍留在隔离区的
+        原行即使有部分修订值也不计入，保证契约用真实结果行数复验。
+        """
+        contract = self._find(contract_no)
+        if contract is None:
+            return 0
+        intake_batch = self._intake_batch_of(contract)
+        still_quarantined = {
+            str(r.get("原始行号"))
+            for r in store.rows("row_quarantine")
+            if str(r.get("关联批次")) == intake_batch
+            and r.get("status") in ("已隔离", "复核中")
+        }
+        rows_by_line: dict[str, bool] = {}
+        for r in store.rows("field_parse"):
+            if str(r.get("关联批次")) != intake_batch:
+                continue
+            line = str(r.get("解析行号") or "")
+            if not line:
+                continue
+            ok = r.get("status") == "解析成功"
+            rows_by_line[line] = rows_by_line.get(line, True) and ok
+        return sum(
+            1 for line, ok in rows_by_line.items()
+            if ok and line not in still_quarantined
+        )
+
+    def revalidate_after_reinstate(self, contract_no: str, actual_columns: list[str],
+                                   actual_rows: int | None, check_time: str
+                                   ) -> tuple[bool, list[str], dict[str, Any] | None]:
+        """隔离行回补后重新校验：已通过的契约不得被重复校验改写结论。
+
+        actual_rows 不传时按回补后的实际行数复验，避免沿用回补前的旧行数。
+        """
+        contract = self._find(contract_no)
+        if contract is None:
+            return False, [f"契约 {contract_no} 不存在"], None
+        if contract.get("status") == "已通过":
+            return True, ["契约已通过，保留原校验结论不重复校验"], dict(contract)
+        rows = self.actual_rows_of_batch(contract_no) if actual_rows is None else actual_rows
+        return self.validate_batch(contract_no, actual_columns, rows, check_time)
+
+    def _quarantine_block(self, intake_batch: str) -> tuple[bool, str]:
+        """未复核隔离行阻断契约。
+
+        只有仍留在隔离区（已隔离/复核中）的原行算阻断；已回补、已废弃的行不再拦截。
+        同一原行有多份失败证据时，只要还有一份没处理完，这行就继续阻断。
+        """
+        rows = store.rows("row_quarantine")
         pending = [
             r for r in rows
-            if r.get("关联批次") in candidates
+            if str(r.get("关联批次")) == str(intake_batch)
             and r.get("status") in ("已隔离", "复核中")
         ]
         if pending:
@@ -127,16 +179,6 @@ class OutputContractService(BaseModuleService):
                 f"未通过的契约不得进入结果投递"
             )
         return True, f"契约 {contract_no} 已通过，允许投递"
-
-    def revalidate_after_reinstate(self, contract_no: str, actual_columns: list[str],
-                                   actual_rows: int, check_time: str) -> tuple[bool, list[str], dict[str, Any] | None]:
-        """隔离行回补后重新校验：已通过的契约不得被重复校验改写结论。"""
-        contract = self._find(contract_no)
-        if contract is None:
-            return False, [f"契约 {contract_no} 不存在"], None
-        if contract.get("status") == "已通过":
-            return True, ["契约已通过，保留原校验结论不重复校验"], dict(contract)
-        return self.validate_batch(contract_no, actual_columns, actual_rows, check_time)
 
     def pass_ratio(self) -> float:
         """契约通过率：已通过 / 全部契约条目。"""

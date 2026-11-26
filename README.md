@@ -11,7 +11,8 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
-│   ├── src/data/modules.ts              18个业务模块配置
+│   ├── src/views/QuarantineReviewView.vue  坏行复核清单（领办/写回/契约复验）
+│   ├── src/data/modules.ts              业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
@@ -72,6 +73,26 @@ npm run dev
 | 解析指标 | `parse_metric` | 指标读数 | 指标读数编号、统计窗口、来源渠道 |
 | 模板差异 | `tmpl_diff` | 差异条目 | 差异编号、旧模板版本、新模板版本 |
 | 投递审计 | `intake_audit` | 审计条目 | 审计编号、关联对象、操作类型 |
+
+## 坏行复核清单
+
+同一原行可能出现多份失败证据（最早的解析隔离 + 后来补入的字段错误），因此隔离行按
+**原行**复用，新字段作为后续证据并入，不再新建隔离行。复核链路的接口约定：
+
+| 接口 | 作用 |
+| --- | --- |
+| `GET /api/row_quarantine/checklist?batch=&fields=` | 按批次和失败字段查复核清单，按原行排列并列出全部证据 |
+| `GET /api/row_quarantine/evidence?batch=&row=` | 原行回查：历史原文与后续补入的错误证据按时间重放 |
+| `GET /api/row_quarantine/{隔离编号}/receipt` | 变更回执：保留已填修订值，列出可继续提交的字段与需重新领取的字段 |
+| `POST /api/row_quarantine/{id}/actions` | `领办`（服务端按证据判定可处理字段）、`回补批次`（带修订值写回） |
+| `POST /api/output_contract/validate` | 不传 `actual_rows` 时按回补后的实际行数复验契约 |
+
+关键约束：同一原行的不同失败字段可由不同复核员分别领办；已填修订值不会因为回执
+而丢失；仍未核完失败字段的原行留在隔离区并阻断契约；同一批次同一原行的有效回补
+只增加一条成功行，重复提交也只算一次。
+
+演示数据：批次 `FI-20260903001`（`PB-006`，8 成功 / 2 隔离），第 7 行邮编问题、
+第 8 行金额问题，对应契约 `OC-005`。前端入口 `/quarantine-review`。
 
 ## 约定
 

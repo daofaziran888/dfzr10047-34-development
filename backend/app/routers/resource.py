@@ -8,7 +8,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import (
+    ActionPayload,
+    ActionResult,
+    EntryPayload,
+    PageResult,
+    ValidatePayload,
+)
 from app.services import service_for
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -73,6 +79,69 @@ def export_entries(
     )
 
 
+@router.get("/row_quarantine/checklist")
+def quarantine_checklist(
+    batch: str = Query(default="", description="关联批次，必填"),
+    fields: str = Query(default="", description="按失败字段筛选，逗号分隔"),
+    field: str = Query(default="", description="单个失败字段筛选（fields 的单值写法）"),
+) -> dict[str, Any]:
+    """坏行复核清单：按批次(必填)和失败字段(可选)查询，按原行排列并列出证据。"""
+    service = require_service("row_quarantine")
+    if not batch.strip():
+        raise HTTPException(status_code=400, detail="必须指定批次")
+    raw = fields or field
+    selected = [f.strip() for f in raw.replace("，", ",").split(",") if f.strip()]
+    items = service.filter_checklist(batch.strip(), selected)
+    return {"items": items, "total": len(items), "batch": batch.strip(),
+            "fields": selected}
+
+
+@router.get("/row_quarantine/evidence")
+def quarantine_evidence(batch: str = Query(default=""), row: str = Query(default="")) -> dict[str, Any]:
+    """原行回查：历史原文与后来补入的失败证据按时间顺序返回。"""
+    service = require_service("row_quarantine")
+    if not batch.strip() or not row.strip():
+        raise HTTPException(status_code=400, detail="必须指定批次和原始行号")
+    return service.row_evidence_trail(batch.strip(), row.strip())
+
+
+@router.get("/row_quarantine/{quarantine_no}/receipt")
+def quarantine_receipt(quarantine_no: str) -> dict[str, Any]:
+    """变更回执：保留已填修订值，指明还能提交什么、哪些需要重新领取。"""
+    service = require_service("row_quarantine")
+    receipt = service.change_receipt(quarantine_no)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail=f"隔离行 {quarantine_no} 不存在")
+    return receipt
+
+
+@router.post("/row_quarantine/{quarantine_no}/revise", response_model=ActionResult)
+def quarantine_revise(quarantine_no: str, payload: ActionPayload) -> ActionResult:
+    """提交复核修订值并回补批次；未核完的字段会让原行继续留在隔离区。"""
+    service = require_service("row_quarantine")
+    reviewer = (payload.reviewer or "").strip()
+    if not reviewer:
+        return ActionResult(ok=False, message="缺少复核人标识，无法登记修订值")
+    row, message = service.apply_revision(
+        quarantine_no, reviewer, payload.revised_values,
+        payload.remark or "")
+    return ActionResult(ok=row is not None, message=message, entry=row)
+
+
+@router.post("/output_contract/validate", response_model=ActionResult)
+def output_contract_validate(payload: ValidatePayload) -> ActionResult:
+    """按回补后的实际行数复验输出契约，行数不传时取真实结果行数。"""
+    service = require_service("output_contract")
+    passed, failures, contract = service.revalidate_after_reinstate(
+        payload.contract_no, payload.actual_columns, payload.actual_rows,
+        payload.check_time)
+    return ActionResult(
+        ok=passed,
+        message=("契约校验通过" if passed else ";".join(failures) or "契约校验未通过"),
+        entry=contract,
+    )
+
+
 @router.get("/{module}/{entry_id}", response_model=dict)
 def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     service = require_service(module)
@@ -81,18 +150,20 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"{service.ENTITY} {entry_id} 不存在或已归档")
     return entry
 
-
 @router.post("/{module}", response_model=ActionResult)
 def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     service = require_service(module)
-    entry, missing = service.create_entry(payload.values)
-    if missing:
-        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+    entry, problems = service.create_entry(payload.values)
+    if problems:
+        return ActionResult(ok=False, message=service.create_error_message(problems))
     return ActionResult(ok=True, message=f"{service.ENTITY}已登记", entry=entry)
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    entry, message = service.run_action(
+        entry_id, payload.action.strip(),
+        payload.model_dump(exclude_none=True),
+    )
     return ActionResult(ok=entry is not None, message=message, entry=entry)

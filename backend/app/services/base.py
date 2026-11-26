@@ -59,7 +59,12 @@ class BaseModuleService:
         rows.append(entry)
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def create_error_message(self, problems: list[str]) -> str:
+        """登记失败提示：默认按缺少必填字段格式化，特殊模块可覆盖。"""
+        return f"缺少必填字段：{'、'.join(problems)}"
+
+    def run_action(self, entry_id: int, action: str,
+                   payload: dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"

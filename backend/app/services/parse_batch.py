@@ -57,7 +57,11 @@ class ParseBatchService(BaseModuleService):
         }
 
     def refresh_batch_counts(self, intake_batch: str) -> tuple[bool, str, dict[str, Any] | None]:
-        """按字段解析与坏行隔离的真实计数刷新批次行数，不允许人工填数。"""
+        """按字段解析与坏行隔离的真实计数刷新批次行数，不允许人工填数。
+
+        成功行以字段解析明细里按行聚合后全成功的行数为准：同一批次同一原行不论
+        回补多少次，只算一条成功行；仍留在隔离区（还有未核完失败字段）的行不计入成功。
+        """
         batch = self._find_by_intake(intake_batch)
         if batch is None:
             return False, f"投递批次 {intake_batch} 没有对应批次记录", None
@@ -66,15 +70,43 @@ class ParseBatchService(BaseModuleService):
 
         parse_tally = self.tally_from_field_parse(intake_batch)
         quarantine_tally = self.tally_from_quarantine(intake_batch)
+        # 仍处在隔离中（已隔离/复核中）的原行即使有部分修订值也不能算成功。
+        still_isolated = {
+            str(r.get("原始行号"))
+            for r in store.rows("row_quarantine")
+            if str(r.get("关联批次")) == str(intake_batch)
+            and r.get("status") in ("已隔离", "复核中")
+        }
+        rows_by_line: dict[str, bool] = {}
+        for r in store.rows("field_parse"):
+            if str(r.get("关联批次")) != str(intake_batch):
+                continue
+            line = str(r.get("解析行号") or "")
+            if not line:
+                continue
+            ok = r.get("status") == "解析成功"
+            rows_by_line[line] = rows_by_line.get(line, True) and ok
+        succeeded_rows = sum(
+            1 for line, ok in rows_by_line.items() if ok and line not in still_isolated)
         quarantined = quarantine_tally["quarantined"] - quarantine_tally["reinstated"]
-        success = parse_tally["success_rows"] + quarantine_tally["reinstated"]
 
         batch["总行数"] = str(parse_tally["total_rows"])
-        batch["成功行数"] = str(success)
+        batch["成功行数"] = str(succeeded_rows)
         batch["隔离行数"] = str(max(0, quarantined))
+        if max(0, quarantined) == 0 and parse_tally["total_rows"] > 0 \
+                and batch.get("批次状态") not in ("已闭合", "闭合"):
+            batch["批次状态"] = "已闭合"
+            batch["status"] = "已闭合"
+            batch["pending"] = False
+            batch["abnormal"] = False
+        elif max(0, quarantined) > 0:
+            batch["批次状态"] = "存在隔离"
+            batch["status"] = "存在隔离"
+            batch["pending"] = True
+            batch["abnormal"] = True
         return True, (
             f"批次 {intake_batch} 计数已按真实明细刷新："
-            f"总 {parse_tally['total_rows']} / 成功 {success} / 隔离 {max(0, quarantined)}"
+            f"总 {parse_tally['total_rows']} / 成功 {succeeded_rows} / 隔离 {max(0, quarantined)}"
         ), dict(batch)
 
     def close_batch(self, intake_batch: str, close_time: str) -> tuple[bool, str, dict[str, Any] | None]:

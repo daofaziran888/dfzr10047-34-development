@@ -16,13 +16,27 @@ class Store:
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        # 以 `_` 开头的表是流程内部台账（如坏行复核领办回执），
+        # 不作为业务模块出现在概览与健康检查里。
+        return sorted(name for name in self._tables if not name.startswith("_"))
 
     def reload_seed(self) -> None:
-        """把全部表恢复成 seed.py 的初始示例数据，供本地重置与测试隔离使用。"""
+        """把全部表恢复成 seed.py 的初始示例数据，供本地重置与测试隔离使用。
+
+        运行期内部台账（以 `_` 开头，如坏行复核证据与领办记录）一并清空，
+        否则上一轮隔离状态会污染新一轮的复核清单。
+        """
         self._tables = {
-            name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
+            name: [dict(row) for row in rows]
+            for name, rows in SEED_ROWS.items()
+            if not name.startswith("_")
         }
+        self.drop_runtime_tables()
+
+    def drop_runtime_tables(self) -> None:
+        """清空运行期才产生的内部台账（以 `_` 开头），重置时与 seed 一起回到初始态。"""
+        for name in [n for n in self._tables if n.startswith("_")]:
+            self._tables.pop(name, None)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
